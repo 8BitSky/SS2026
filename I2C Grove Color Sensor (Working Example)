@@ -1,0 +1,223 @@
+#include <PRIZM.h>
+#include <Wire.h>
+
+PRIZM prizm;
+
+// =====================================================
+// Grove Color Sensor V2.0 / TCS3472
+// Final PRIZM test sketch using enum-based color results
+// =====================================================
+
+// ---------- I2C ----------
+const byte COLOR_ADDR = 0x29;
+
+// ---------- TCS3472 registers ----------
+const byte REG_ENABLE   = 0x80 | 0x00;
+const byte REG_ATIME    = 0x80 | 0x01;
+const byte REG_CONTROL  = 0x80 | 0x0F;
+const byte REG_ID       = 0x80 | 0x12;
+const byte REG_CDATAL   = 0x80 | 0x14;
+const byte REG_RDATAL   = 0x80 | 0x16;
+const byte REG_GDATAL   = 0x80 | 0x18;
+const byte REG_BDATAL   = 0x80 | 0x1A;
+
+// ---------- ENABLE bits ----------
+const byte ENABLE_PON = 0x01;
+const byte ENABLE_AEN = 0x02;
+
+// ---------- Classification thresholds ----------
+const uint16_t MIN_CLEAR_VALUE = 120;
+
+const float YELLOW_R_MIN = 0.35f;
+const float YELLOW_G_MIN = 0.32f;
+const float YELLOW_B_MAX = 0.30f;
+
+const float GREEN_OVER_RED  = 0.06f;
+const float GREEN_OVER_BLUE = 0.03f;
+
+const float RED_OVER_GREEN = 0.04f;
+const float RED_OVER_BLUE  = 0.01f;
+
+const float BLUE_OVER_RED   = 0.05f;
+const float BLUE_OVER_GREEN = 0.05f;
+
+// ---------- Print timing ----------
+const unsigned long PRINT_INTERVAL_MS = 300;
+unsigned long lastPrintMs = 0;
+
+// =====================================================
+// Data types
+// =====================================================
+struct ColorData {
+  uint16_t clear;
+  uint16_t red;
+  uint16_t green;
+  uint16_t blue;
+};
+
+enum DetectedColor {
+  COLOR_NONE,
+  COLOR_TOO_DIM,
+  COLOR_RED,
+  COLOR_GREEN,
+  COLOR_BLUE,
+  COLOR_YELLOW,
+  COLOR_UNKNOWN
+};
+
+// =====================================================
+// I2C helpers
+// =====================================================
+bool colorWriteReg8(byte reg, byte value) {
+  Wire.beginTransmission(COLOR_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  return (Wire.endTransmission() == 0);
+}
+
+bool colorReadReg8(byte reg, byte &value) {
+  Wire.beginTransmission(COLOR_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+
+  byte count = Wire.requestFrom(COLOR_ADDR, (uint8_t)1);
+  if (count != 1 || !Wire.available()) return false;
+
+  value = Wire.read();
+  return true;
+}
+
+bool colorReadReg16(byte lowReg, uint16_t &value) {
+  Wire.beginTransmission(COLOR_ADDR);
+  Wire.write(lowReg);
+  if (Wire.endTransmission(false) != 0) return false;
+
+  byte count = Wire.requestFrom(COLOR_ADDR, (uint8_t)2);
+  if (count != 2 || Wire.available() < 2) return false;
+
+  byte lowByte = Wire.read();
+  byte highByte = Wire.read();
+  value = ((uint16_t)highByte << 8) | lowByte;
+  return true;
+}
+
+// =====================================================
+// Sensor helpers
+// =====================================================
+bool initColorSensor() {
+  byte idVal = 0;
+
+  Wire.beginTransmission(COLOR_ADDR);
+  if (Wire.endTransmission() != 0) return false;
+
+  colorReadReg8(REG_ID, idVal);  // optional read for sanity check
+
+  if (!colorWriteReg8(REG_ENABLE, ENABLE_PON)) return false;
+  delay(5);
+
+  if (!colorWriteReg8(REG_ATIME, 0xD5)) return false;     // integration time
+  if (!colorWriteReg8(REG_CONTROL, 0x01)) return false;   // gain = 4x
+  if (!colorWriteReg8(REG_ENABLE, ENABLE_PON | ENABLE_AEN)) return false;
+
+  delay(50);
+  return true;
+}
+
+bool readColorData(ColorData &data) {
+  bool ok = true;
+  ok &= colorReadReg16(REG_CDATAL, data.clear);
+  ok &= colorReadReg16(REG_RDATAL, data.red);
+  ok &= colorReadReg16(REG_GDATAL, data.green);
+  ok &= colorReadReg16(REG_BDATAL, data.blue);
+  return ok;
+}
+
+DetectedColor classifyColor(const ColorData &data) {
+  if (data.clear < MIN_CLEAR_VALUE) return COLOR_TOO_DIM;
+
+  float sum = (float)data.red + (float)data.green + (float)data.blue;
+  if (sum < 1.0f) return COLOR_NONE;
+
+  float rN = (float)data.red / sum;
+  float gN = (float)data.green / sum;
+  float bN = (float)data.blue / sum;
+
+  if (rN > YELLOW_R_MIN && gN > YELLOW_G_MIN && bN < YELLOW_B_MAX) {
+    return COLOR_YELLOW;
+  }
+
+  if (gN > rN + GREEN_OVER_RED && gN > bN + GREEN_OVER_BLUE) {
+    return COLOR_GREEN;
+  }
+
+  if (rN > gN + RED_OVER_GREEN && rN > bN + RED_OVER_BLUE && gN < bN) {
+    return COLOR_RED;
+  }
+
+  if (bN > rN + BLUE_OVER_RED && bN > gN + BLUE_OVER_GREEN) {
+    return COLOR_BLUE;
+  }
+
+  return COLOR_UNKNOWN;
+}
+
+const char* colorToString(DetectedColor color) {
+  switch (color) {
+    case COLOR_NONE:    return "NONE";
+    case COLOR_TOO_DIM: return "TOO_DIM";
+    case COLOR_RED:     return "RED";
+    case COLOR_GREEN:   return "GREEN";
+    case COLOR_BLUE:    return "BLUE";
+    case COLOR_YELLOW:  return "YELLOW";
+    case COLOR_UNKNOWN: return "UNKNOWN";
+    default:            return "UNKNOWN";
+  }
+}
+
+void printColorResult(const ColorData &data, DetectedColor detected) {
+  Serial.print("C=");
+  Serial.print(data.clear);
+  Serial.print(" R=");
+  Serial.print(data.red);
+  Serial.print(" G=");
+  Serial.print(data.green);
+  Serial.print(" B=");
+  Serial.print(data.blue);
+  Serial.print(" -> ");
+  Serial.println(colorToString(detected));
+}
+
+// =====================================================
+// Setup / loop
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  prizm.PrizmBegin();
+  Wire.begin();
+  Wire.setClock(100000);
+
+  if (initColorSensor()) {
+    Serial.println("Color sensor ready.");
+  } else {
+    Serial.println("Color sensor failed.");
+  }
+}
+
+void loop() {
+  if (millis() - lastPrintMs >= PRINT_INTERVAL_MS) {
+    lastPrintMs = millis();
+
+    ColorData color;
+    if (readColorData(color)) {
+      DetectedColor detected = classifyColor(color);
+      printColorResult(color, detected);
+
+      // Example for later robot integration:
+      // if (detected == COLOR_GREEN) {
+      //   // release object
+      // }
+    } else {
+      Serial.println("Color read failed.");
+    }
+  }
+}
