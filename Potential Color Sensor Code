@@ -1,0 +1,209 @@
+#include <PRIZM.h>
+#include <Wire.h>
+
+PRIZM prizm;
+
+// =====================================================
+// Grove I2C Color Sensor test for TETRIX PRIZM
+// Based on Seeed Grove I2C Color Sensor (older TCS3414CS version)
+// Change these constants at the top if needed
+// =====================================================
+
+// ---- I2C addresses to try ----
+// Older Grove I2C Color Sensor wiki/library: TCS3414CS-based
+const byte COLOR_ADDR_PRIMARY   = 0x39;
+
+// If you later discover you actually have the newer V2.0 board,
+// that wiki notes a different chip/library is used.
+const byte COLOR_ADDR_SECONDARY = 0x29;
+
+// ---- Basic control / identification registers ----
+// These are common TCS3414-style values used for first communication tests.
+// This sketch is meant to confirm bus access and raw register reads first.
+const byte REG_ENABLE     = 0x80;
+const byte REG_ATIME      = 0x81;
+const byte REG_CONTROL    = 0x8F;
+const byte REG_ID         = 0x84;
+
+// Candidate low-byte data registers for clear/R/G/B style reads.
+// These may need adjustment once you confirm your exact board behavior.
+const byte REG_DATA_START = 0x90;
+
+// ---- Timing ----
+const unsigned long PRINT_INTERVAL_MS = 500;
+
+// ---- Globals ----
+byte activeColorAddr = COLOR_ADDR_PRIMARY;
+bool sensorFound = false;
+unsigned long lastPrintMs = 0;
+
+// =====================================================
+// I2C helpers
+// =====================================================
+bool i2cDevicePresent(byte addr) {
+  Wire.beginTransmission(addr);
+  byte err = Wire.endTransmission();
+  return (err == 0);
+}
+
+bool writeReg8(byte addr, byte reg, byte value) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write(value);
+  return (Wire.endTransmission() == 0);
+}
+
+bool readReg8(byte addr, byte reg, byte &value) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+
+  byte count = Wire.requestFrom(addr, (uint8_t)1);
+  if (count != 1 || !Wire.available()) return false;
+
+  value = Wire.read();
+  return true;
+}
+
+bool readReg16LE(byte addr, byte reg, uint16_t &value) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+
+  byte count = Wire.requestFrom(addr, (uint8_t)2);
+  if (count != 2 || Wire.available() < 2) return false;
+
+  byte low = Wire.read();
+  byte high = Wire.read();
+  value = ((uint16_t)high << 8) | low;
+  return true;
+}
+
+void scanI2CBus() {
+  Serial.println("Scanning I2C bus...");
+
+  bool foundAny = false;
+  for (byte addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    byte err = Wire.endTransmission();
+
+    if (err == 0) {
+      foundAny = true;
+      Serial.print("Found device at 0x");
+      if (addr < 16) Serial.print("0");
+      Serial.println(addr, HEX);
+    }
+  }
+
+  if (!foundAny) {
+    Serial.println("No I2C devices found.");
+  }
+}
+
+// =====================================================
+// Sensor init
+// =====================================================
+bool initColorSensor(byte addr) {
+  Serial.print("Trying color sensor at 0x");
+  if (addr < 16) Serial.print("0");
+  Serial.println(addr, HEX);
+
+  if (!i2cDevicePresent(addr)) {
+    Serial.println("  No ACK at this address.");
+    return false;
+  }
+
+  // Very light-touch init for communication testing.
+  // These writes may need tuning later, but are useful as a first pass.
+  bool ok = true;
+  ok &= writeReg8(addr, REG_ENABLE, 0x03);  // power/ADC enable style test value
+  ok &= writeReg8(addr, REG_ATIME,  0x00);  // integration timing test value
+  ok &= writeReg8(addr, REG_CONTROL, 0x00); // gain/control test value
+
+  if (!ok) {
+    Serial.println("  Basic register write failed.");
+    return false;
+  }
+
+  byte idVal = 0;
+  if (readReg8(addr, REG_ID, idVal)) {
+    Serial.print("  ID register read: 0x");
+    if (idVal < 16) Serial.print("0");
+    Serial.println(idVal, HEX);
+  } else {
+    Serial.println("  Could not read ID register (not fatal for first test).");
+  }
+
+  Serial.println("  Basic init complete.");
+  return true;
+}
+
+// =====================================================
+// Raw readout
+// =====================================================
+void printRawColorData(byte addr) {
+  // Try reading four 16-bit values starting at 0x90.
+  // This is a practical probe for clear/R/G/B style register blocks.
+  uint16_t ch0 = 0, ch1 = 0, ch2 = 0, ch3 = 0;
+
+  bool ok0 = readReg16LE(addr, REG_DATA_START + 0, ch0);
+  bool ok1 = readReg16LE(addr, REG_DATA_START + 2, ch1);
+  bool ok2 = readReg16LE(addr, REG_DATA_START + 4, ch2);
+  bool ok3 = readReg16LE(addr, REG_DATA_START + 6, ch3);
+
+  if (!(ok0 && ok1 && ok2 && ok3)) {
+    Serial.println("Raw channel read failed.");
+    return;
+  }
+
+  Serial.print("Raw channels: ");
+  Serial.print("CH0=");
+  Serial.print(ch0);
+  Serial.print("  CH1=");
+  Serial.print(ch1);
+  Serial.print("  CH2=");
+  Serial.print(ch2);
+  Serial.print("  CH3=");
+  Serial.println(ch3);
+}
+
+// =====================================================
+// Setup / loop
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  prizm.PrizmBegin();
+  Wire.begin();
+  Wire.setClock(100000);  // conservative first test speed
+
+  delay(300);
+  Serial.println();
+  Serial.println("PRIZM Grove I2C Color Sensor Test");
+  Serial.println("--------------------------------");
+
+  scanI2CBus();
+
+  if (initColorSensor(COLOR_ADDR_PRIMARY)) {
+    activeColorAddr = COLOR_ADDR_PRIMARY;
+    sensorFound = true;
+  } else if (initColorSensor(COLOR_ADDR_SECONDARY)) {
+    activeColorAddr = COLOR_ADDR_SECONDARY;
+    sensorFound = true;
+  } else {
+    sensorFound = false;
+    Serial.println("No supported color sensor found at expected addresses.");
+    Serial.println("Check wiring, sensor version, and I2C power.");
+  }
+}
+
+void loop() {
+  if (!sensorFound) {
+    delay(1000);
+    return;
+  }
+
+  if (millis() - lastPrintMs >= PRINT_INTERVAL_MS) {
+    lastPrintMs = millis();
+    printRawColorData(activeColorAddr);
+  }
+}
