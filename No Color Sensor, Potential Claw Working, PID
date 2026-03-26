@@ -1,0 +1,863 @@
+#include <PRIZM.h>
+#include <Wire.h>
+
+PRIZM prizm;
+
+// =====================================================
+// ---------------- HARDWARE DEFINITIONS ----------------
+// Change these in one place if wiring changes
+// =====================================================
+
+// ---------- Yahboom 8-channel line sensor ----------
+#define LINE_SENSOR_I2C_ADDR   0x12
+#define LINE_SENSOR_RAW_REG    0x00
+#define LINE_SENSOR_INVERT_RAW false
+
+// ---------- Ultrasonic sensor ports ----------
+const byte FRONT_US_PORT = 3;
+const byte RIGHT_US_PORT = 4;
+const byte LEFT_US_PORT  = 5;
+
+// ---------- Claw servo ----------
+const byte CLAW_SERVO_PORT = 1;
+const int CLAW_OPEN_DEG    = 90;
+const int CLAW_CLOSED_DEG  = 40;
+
+// ---------- Claw object detection ----------
+// Sensor is a reflective IR module tuned via onboard potentiometer.
+// It acts as a short-range proximity sensor inside the claw.
+// CLAW_OBJECT_STATE defines which digital value means "object detected".
+// (Verify during testing: may be 1 or 0 depending on wiring/module)
+const byte CLAW_IR_PORT      = 2;   // <-- change to actual PRIZM sensor port
+const int CLAW_OBJECT_STATE  = 1;   // <-- change to 0 if testing shows opposite
+
+// ---------- Optional tuning potentiometer ----------
+const int KP_POT_PIN = A2;
+
+// =====================================================
+// ---------------- MOTOR / SPEED SETTINGS -------------
+// PRIZM motor speeds are degrees per second (dps)
+// =====================================================
+const int BASE_DPS         = 220;
+const int TURN_DPS         = 260;
+const int SEARCH_DPS       = 180;
+const int BACKUP_DPS       = -180;
+const int APPROACH_DPS     = 90;
+const int CARRY_DPS        = 200;
+const int CARRY_BACKUP_DPS = -170;
+const int MAX_DPS          = 720;
+
+// =====================================================
+// ---------------- DISTANCE THRESHOLDS ----------------
+// =====================================================
+const int FRONT_APPROACH_CM    = 12;  // something ahead, inspect slowly
+const int FRONT_WALL_REJECT_CM = 5;   // too close, no claw detection -> wall
+const int FRONT_OBSTACLE_CM    = 10;  // general front obstacle threshold
+const int SIDE_LIMIT_CM        = 8;
+
+const int FRONT_CLEAR_CM       = 13;  // hysteresis clear threshold
+const int SIDE_CLEAR_CM        = 10;
+
+const int CARRY_SIDE_NEAR_CM   = 10;
+
+// =====================================================
+// ---------------- PID SETTINGS -----------------------
+// =====================================================
+float Kp = 0.25f;
+float Ki = 0.00f;
+float Kd = 0.08f;
+
+const float KP_MIN = 0.00f;
+const float KP_MAX = 1.00f;
+
+const float INTEGRAL_CLAMP = 2500.0f;
+const float OUTPUT_CLAMP   = 450.0f;
+const int DEAD_BAND        = 180;
+
+// =====================================================
+// ---------------- LINE SENSOR SETTINGS ---------------
+// =====================================================
+const int LINE_MIN_POS    = 0;
+const int LINE_MAX_POS    = 7000;
+const int TARGET_POSITION = 3500;
+
+const byte LINE_SAMPLE_COUNT = 5;
+const float LINE_ALPHA       = 0.35f;
+const byte MIN_ACTIVE_BITS   = 1;
+
+// =====================================================
+// ---------------- TIMING SETTINGS --------------------
+// =====================================================
+const unsigned long LOST_LINE_GRACE_MS         = 150;
+const unsigned long SEARCH_SWEEP_MS            = 500;
+const unsigned long SEARCH_PAUSE_MS            = 120;
+const unsigned long SEARCH_STOP_TIMEOUT_MS     = 3500;
+
+const unsigned long BACKUP_DURATION_MS         = 500;
+const unsigned long TURN_TO_LINE_MS            = 450;
+
+const unsigned long APPROACH_TIMEOUT_MS        = 2500;
+const unsigned long GRAB_SETTLE_MS             = 350;
+const unsigned long REJECT_BACKUP_MS           = 450;
+
+const unsigned long CARRY_LOST_LINE_TIMEOUT_MS = 500;
+const unsigned long CARRY_RECOVERY_BACKUP_MS   = 500;
+const unsigned long CARRY_RECOVERY_TURN_MS     = 650;
+
+const unsigned long IR_CONFIRM_MS              = 80;
+
+// =====================================================
+// ---------------- DEBUG ------------------------------
+// =====================================================
+#define DEBUG_SERIAL true
+unsigned long lastDebugPrint = 0;
+const unsigned long DEBUG_INTERVAL_MS = 250;
+
+// =====================================================
+// ---------------- STATE MACHINE ----------------------
+// =====================================================
+enum RobotState {
+  STATE_FOLLOW_LINE,
+  STATE_BACKUP_SCAN,
+  STATE_TURN_TO_LINE,
+  STATE_SEARCH_SWEEP_LEFT,
+  STATE_SEARCH_SWEEP_RIGHT,
+  STATE_SEARCH_PAUSE,
+  STATE_APPROACH_TARGET,
+  STATE_GRAB_OBJECT,
+  STATE_REJECT_WALL,
+  STATE_CARRY_OBJECT,
+  STATE_CARRY_DEADEND_BACKUP,
+  STATE_CARRY_DEADEND_TURN
+};
+
+RobotState state = STATE_FOLLOW_LINE;
+unsigned long stateStartMs = 0;
+unsigned long lastLoopMs = 0;
+unsigned long lastLineSeenMs = 0;
+unsigned long clawIrActiveStartMs = 0;
+
+// =====================================================
+// ---------------- GLOBAL VARIABLES -------------------
+// =====================================================
+float smoothedLinePosition = TARGET_POSITION;
+int lastKnownPosition = TARGET_POSITION;
+int lineConfidence = 0;
+
+float pidIntegral = 0.0f;
+float lastError = 0.0f;
+
+bool frontObstacleLatched = false;
+bool leftObstacleLatched = false;
+bool rightObstacleLatched = false;
+
+int rememberedBackupLinePos = -1;
+bool hasObject = false;
+
+// =====================================================
+// ---------------- BASIC HELPERS ----------------------
+// =====================================================
+void setMotorDPS(int leftDps, int rightDps) {
+  leftDps = constrain(leftDps, -MAX_DPS, MAX_DPS);
+  rightDps = constrain(rightDps, -MAX_DPS, MAX_DPS);
+  prizm.setMotorSpeeds(leftDps, rightDps);
+}
+
+void stopMotors() {
+  setMotorDPS(0, 0);
+}
+
+void changeState(RobotState newState) {
+  state = newState;
+  stateStartMs = millis();
+}
+
+void openClaw() {
+  prizm.setServoPosition(CLAW_SERVO_PORT, CLAW_OPEN_DEG);
+}
+
+void closeClaw() {
+  prizm.setServoPosition(CLAW_SERVO_PORT, CLAW_CLOSED_DEG);
+}
+
+byte invertMaskIfNeeded(byte raw) {
+  return LINE_SENSOR_INVERT_RAW ? ~raw : raw;
+}
+
+// =====================================================
+// ---------------- CLAW OBJECT SENSOR -----------------
+// =====================================================
+bool clawIrRawDetected() {
+  return prizm.readLineSensor(CLAW_IR_PORT) == CLAW_OBJECT_STATE;
+}
+
+// Requires stable detection for IR_CONFIRM_MS
+bool clawIrConfirmed() {
+  bool detected = clawIrRawDetected();
+
+  if (detected) {
+    if (clawIrActiveStartMs == 0) {
+      clawIrActiveStartMs = millis();
+    }
+    if (millis() - clawIrActiveStartMs >= IR_CONFIRM_MS) {
+      return true;
+    }
+  } else {
+    clawIrActiveStartMs = 0;
+  }
+
+  return false;
+}
+
+void resetClawIrConfirmation() {
+  clawIrActiveStartMs = 0;
+}
+
+// =====================================================
+// ---------------- I2C LINE SENSOR --------------------
+// =====================================================
+bool readRawLineByte(byte &rawOut) {
+  Wire.beginTransmission(LINE_SENSOR_I2C_ADDR);
+  Wire.write(LINE_SENSOR_RAW_REG);
+  byte txStatus = Wire.endTransmission(false);
+  if (txStatus != 0) return false;
+
+  byte requested = Wire.requestFrom(LINE_SENSOR_I2C_ADDR, (uint8_t)1);
+  if (requested != 1 || !Wire.available()) return false;
+
+  rawOut = Wire.read();
+  return true;
+}
+
+int computeLinePositionFromMask(byte mask) {
+  long weightedSum = 0;
+  int activeCount = 0;
+
+  for (int i = 0; i < 8; i++) {
+    int bitValue = (mask >> i) & 0x01;
+    if (bitValue) {
+      activeCount++;
+      weightedSum += (long)i * 1000L;
+    }
+  }
+
+  if (activeCount < MIN_ACTIVE_BITS) return -1;
+  return (int)(weightedSum / activeCount);
+}
+
+int getRobustLinePosition(byte &finalMask, bool &validRead) {
+  int validSamples = 0;
+  int posSamples[LINE_SAMPLE_COUNT];
+  byte maskSamples[LINE_SAMPLE_COUNT];
+
+  for (byte i = 0; i < LINE_SAMPLE_COUNT; i++) {
+    byte raw;
+    bool ok = readRawLineByte(raw);
+    if (!ok) continue;
+
+    byte mask = invertMaskIfNeeded(raw);
+    int pos = computeLinePositionFromMask(mask);
+
+    if (pos != -1) {
+      maskSamples[validSamples] = mask;
+      posSamples[validSamples] = pos;
+      validSamples++;
+    }
+  }
+
+  if (validSamples == 0) {
+    validRead = false;
+    finalMask = 0;
+    return -1;
+  }
+
+  byte mergedMask = 0;
+  for (int bit = 0; bit < 8; bit++) {
+    int seenCount = 0;
+    for (int i = 0; i < validSamples; i++) {
+      seenCount += ((maskSamples[i] >> bit) & 0x01);
+    }
+    if (seenCount * 2 >= validSamples) {
+      mergedMask |= (1 << bit);
+    }
+  }
+
+  int mergedPos = computeLinePositionFromMask(mergedMask);
+  if (mergedPos == -1) {
+    long sum = 0;
+    for (int i = 0; i < validSamples; i++) sum += posSamples[i];
+    mergedPos = (int)(sum / validSamples);
+  }
+
+  finalMask = mergedMask;
+  validRead = true;
+  return mergedPos;
+}
+
+bool updateLineTracking(byte &maskOut, int &positionOut) {
+  bool validRead = false;
+  byte mask = 0;
+  int rawPosition = getRobustLinePosition(mask, validRead);
+
+  if (!validRead || rawPosition == -1) {
+    if (lineConfidence > 0) lineConfidence--;
+    maskOut = 0;
+    positionOut = -1;
+    return false;
+  }
+
+  smoothedLinePosition =
+      (LINE_ALPHA * rawPosition) +
+      ((1.0f - LINE_ALPHA) * smoothedLinePosition);
+
+  int smoothedInt = (int)smoothedLinePosition;
+  smoothedInt = constrain(smoothedInt, LINE_MIN_POS, LINE_MAX_POS);
+
+  lastKnownPosition = smoothedInt;
+  lastLineSeenMs = millis();
+
+  if (lineConfidence < 20) lineConfidence++;
+
+  maskOut = mask;
+  positionOut = smoothedInt;
+  return true;
+}
+
+// =====================================================
+// ---------------- ULTRASONIC FILTERING ---------------
+// =====================================================
+int readMedianSonicCM(byte port) {
+  int values[3];
+
+  for (int i = 0; i < 3; i++) {
+    int reading = prizm.readSonicSensorCM(port);
+    if (reading <= 0) reading = 255;
+    values[i] = reading;
+    delay(2);
+  }
+
+  if (values[0] > values[1]) { int t = values[0]; values[0] = values[1]; values[1] = t; }
+  if (values[1] > values[2]) { int t = values[1]; values[1] = values[2]; values[2] = t; }
+  if (values[0] > values[1]) { int t = values[0]; values[0] = values[1]; values[1] = t; }
+
+  return values[1];
+}
+
+void updateObstacleLatches(int frontCm, int leftCm, int rightCm) {
+  if (!frontObstacleLatched && frontCm < FRONT_OBSTACLE_CM) frontObstacleLatched = true;
+  else if (frontObstacleLatched && frontCm > FRONT_CLEAR_CM) frontObstacleLatched = false;
+
+  if (!leftObstacleLatched && leftCm < SIDE_LIMIT_CM) leftObstacleLatched = true;
+  else if (leftObstacleLatched && leftCm > SIDE_CLEAR_CM) leftObstacleLatched = false;
+
+  if (!rightObstacleLatched && rightCm < SIDE_LIMIT_CM) rightObstacleLatched = true;
+  else if (rightObstacleLatched && rightCm > SIDE_CLEAR_CM) rightObstacleLatched = false;
+}
+
+// =====================================================
+// ---------------- TUNING -----------------------------
+// =====================================================
+void updateTuning() {
+  int potValue = analogRead(KP_POT_PIN);
+  Kp = KP_MIN + ((float)potValue / 1023.0f) * (KP_MAX - KP_MIN);
+}
+
+// =====================================================
+// ---------------- PID -------------------------------
+// =====================================================
+int computePidCorrection(int position, float dt) {
+  float error = (float)(position - TARGET_POSITION);
+
+  if (abs((int)error) < DEAD_BAND) {
+    pidIntegral = 0.0f;
+    lastError = 0.0f;
+    return 0;
+  }
+
+  pidIntegral += error * dt;
+  if (pidIntegral > INTEGRAL_CLAMP) pidIntegral = INTEGRAL_CLAMP;
+  if (pidIntegral < -INTEGRAL_CLAMP) pidIntegral = -INTEGRAL_CLAMP;
+
+  float derivative = 0.0f;
+  if (dt > 0.0001f) {
+    derivative = (error - lastError) / dt;
+  }
+
+  float output = (Kp * error) + (Ki * pidIntegral) + (Kd * derivative);
+  output = constrain(output, -OUTPUT_CLAMP, OUTPUT_CLAMP);
+
+  lastError = error;
+  return (int)output;
+}
+
+// =====================================================
+// ---------------- RECOVERY HELPERS -------------------
+// =====================================================
+void startBackupRecovery() {
+  rememberedBackupLinePos = -1;
+  pidIntegral = 0.0f;
+  lastError = 0.0f;
+  changeState(STATE_BACKUP_SCAN);
+}
+
+void startSearchRecovery() {
+  pidIntegral = 0.0f;
+  lastError = 0.0f;
+
+  if (lastKnownPosition < TARGET_POSITION) changeState(STATE_SEARCH_SWEEP_LEFT);
+  else changeState(STATE_SEARCH_SWEEP_RIGHT);
+}
+
+void startCarryRecovery() {
+  pidIntegral = 0.0f;
+  lastError = 0.0f;
+  changeState(STATE_CARRY_DEADEND_BACKUP);
+}
+
+// =====================================================
+// ---------------- FOLLOW LINE ------------------------
+// =====================================================
+void handleFollowLine(float dt, int frontCm, int leftCm, int rightCm) {
+  if (hasObject) {
+    changeState(STATE_CARRY_OBJECT);
+    return;
+  }
+
+  // Something ahead -> inspect slowly
+  if (frontCm <= FRONT_APPROACH_CM) {
+    resetClawIrConfirmation();
+    changeState(STATE_APPROACH_TARGET);
+    return;
+  }
+
+  byte mask;
+  int position;
+  bool hasLine = updateLineTracking(mask, position);
+
+  if (!hasLine) {
+    if (millis() - lastLineSeenMs > LOST_LINE_GRACE_MS) {
+      startSearchRecovery();
+      return;
+    } else {
+      setMotorDPS(BASE_DPS, BASE_DPS);
+      return;
+    }
+  }
+
+  int correction = computePidCorrection(position, dt);
+
+  int leftCmd = BASE_DPS + correction;
+  int rightCmd = BASE_DPS - correction;
+
+  // Mild side-wall avoidance layered on top of PID
+  if (leftObstacleLatched) {
+    leftCmd += 80;
+    rightCmd -= 40;
+  }
+  if (rightObstacleLatched) {
+    leftCmd -= 40;
+    rightCmd += 80;
+  }
+
+  setMotorDPS(leftCmd, rightCmd);
+}
+
+// =====================================================
+// ---------------- APPROACH / GRAB --------------------
+// =====================================================
+void handleApproachTarget(float dt, int frontCm, int leftCm, int rightCm) {
+  // Object confirmed inside claw zone
+  if (clawIrConfirmed()) {
+    stopMotors();
+    changeState(STATE_GRAB_OBJECT);
+    return;
+  }
+
+  // Too close and no claw detection -> wall
+  if (frontCm <= FRONT_WALL_REJECT_CM) {
+    stopMotors();
+    changeState(STATE_REJECT_WALL);
+    return;
+  }
+
+  // Timed out trying to inspect
+  if (millis() - stateStartMs > APPROACH_TIMEOUT_MS) {
+    stopMotors();
+    changeState(STATE_REJECT_WALL);
+    return;
+  }
+
+  // Slow creep with reduced steering authority
+  byte mask;
+  int position;
+  bool hasLine = updateLineTracking(mask, position);
+
+  if (!hasLine) {
+    setMotorDPS(APPROACH_DPS, APPROACH_DPS);
+    return;
+  }
+
+  int correction = computePidCorrection(position, dt);
+  correction = constrain(correction, -100, 100);
+
+  int leftCmd = APPROACH_DPS + correction;
+  int rightCmd = APPROACH_DPS - correction;
+
+  setMotorDPS(leftCmd, rightCmd);
+}
+
+void handleGrabObject() {
+  stopMotors();
+  closeClaw();
+
+  if (millis() - stateStartMs >= GRAB_SETTLE_MS) {
+    hasObject = true;
+    resetClawIrConfirmation();
+    changeState(STATE_CARRY_OBJECT);
+  }
+}
+
+void handleRejectWall() {
+  setMotorDPS(BACKUP_DPS, BACKUP_DPS);
+
+  if (millis() - stateStartMs >= REJECT_BACKUP_MS) {
+    startSearchRecovery();
+  }
+}
+
+// =====================================================
+// ---------------- CARRY MODE -------------------------
+// =====================================================
+void handleCarryObject(float dt, int frontCm, int leftCm, int rightCm) {
+  // Ignore front ultrasonic for pickup logic while carrying.
+  // The held object may block the front sensor.
+
+  byte mask;
+  int position;
+  bool hasLine = updateLineTracking(mask, position);
+
+  if (!hasLine) {
+    if (millis() - lastLineSeenMs > CARRY_LOST_LINE_TIMEOUT_MS) {
+      startCarryRecovery();
+      return;
+    } else {
+      setMotorDPS(CARRY_DPS, CARRY_DPS);
+      return;
+    }
+  }
+
+  int correction = computePidCorrection(position, dt);
+
+  int leftCmd = CARRY_DPS + correction;
+  int rightCmd = CARRY_DPS - correction;
+
+  if (leftObstacleLatched) {
+    leftCmd += 80;
+    rightCmd -= 40;
+  }
+  if (rightObstacleLatched) {
+    leftCmd -= 40;
+    rightCmd += 80;
+  }
+
+  setMotorDPS(leftCmd, rightCmd);
+}
+
+void handleCarryDeadendBackup() {
+  setMotorDPS(CARRY_BACKUP_DPS, CARRY_BACKUP_DPS);
+
+  if (millis() - stateStartMs >= CARRY_RECOVERY_BACKUP_MS) {
+    changeState(STATE_CARRY_DEADEND_TURN);
+  }
+}
+
+void handleCarryDeadendTurn() {
+  if (lastKnownPosition < TARGET_POSITION) {
+    setMotorDPS(-TURN_DPS, TURN_DPS);
+  } else {
+    setMotorDPS(TURN_DPS, -TURN_DPS);
+  }
+
+  byte mask;
+  int position;
+  bool hasLine = updateLineTracking(mask, position);
+
+  if (hasLine) {
+    changeState(STATE_CARRY_OBJECT);
+    return;
+  }
+
+  if (millis() - stateStartMs >= CARRY_RECOVERY_TURN_MS) {
+    changeState(STATE_CARRY_OBJECT);
+  }
+}
+
+// =====================================================
+// ---------------- GENERAL RECOVERY -------------------
+// =====================================================
+void handleBackupScan() {
+  byte mask;
+  int position;
+  bool hasLine = updateLineTracking(mask, position);
+
+  if (hasLine) {
+    rememberedBackupLinePos = position;
+  }
+
+  setMotorDPS(BACKUP_DPS, BACKUP_DPS);
+
+  if (millis() - stateStartMs >= BACKUP_DURATION_MS) {
+    changeState(STATE_TURN_TO_LINE);
+  }
+}
+
+void handleTurnToLine() {
+  int leftCmd = 0;
+  int rightCmd = 0;
+
+  if (rememberedBackupLinePos != -1) {
+    if (rememberedBackupLinePos < TARGET_POSITION) {
+      leftCmd = -TURN_DPS;
+      rightCmd = TURN_DPS;
+    } else {
+      leftCmd = TURN_DPS;
+      rightCmd = -TURN_DPS;
+    }
+  } else {
+    int leftCm = readMedianSonicCM(LEFT_US_PORT);
+    int rightCm = readMedianSonicCM(RIGHT_US_PORT);
+
+    if (leftCm > rightCm) {
+      leftCmd = -TURN_DPS;
+      rightCmd = TURN_DPS;
+    } else {
+      leftCmd = TURN_DPS;
+      rightCmd = -TURN_DPS;
+    }
+  }
+
+  setMotorDPS(leftCmd, rightCmd);
+
+  byte mask;
+  int position;
+  bool hasLine = updateLineTracking(mask, position);
+
+  if (hasLine) {
+    changeState(STATE_FOLLOW_LINE);
+    return;
+  }
+
+  if (millis() - stateStartMs >= TURN_TO_LINE_MS) {
+    startSearchRecovery();
+  }
+}
+
+void handleSearchSweepLeft() {
+  setMotorDPS(-SEARCH_DPS, SEARCH_DPS);
+
+  byte mask;
+  int position;
+  bool hasLine = updateLineTracking(mask, position);
+
+  if (hasLine) {
+    if (hasObject) changeState(STATE_CARRY_OBJECT);
+    else changeState(STATE_FOLLOW_LINE);
+    return;
+  }
+
+  if (millis() - stateStartMs >= SEARCH_SWEEP_MS) {
+    changeState(STATE_SEARCH_PAUSE);
+  }
+}
+
+void handleSearchSweepRight() {
+  setMotorDPS(SEARCH_DPS, -SEARCH_DPS);
+
+  byte mask;
+  int position;
+  bool hasLine = updateLineTracking(mask, position);
+
+  if (hasLine) {
+    if (hasObject) changeState(STATE_CARRY_OBJECT);
+    else changeState(STATE_FOLLOW_LINE);
+    return;
+  }
+
+  if (millis() - stateStartMs >= SEARCH_SWEEP_MS) {
+    changeState(STATE_SEARCH_PAUSE);
+  }
+}
+
+void handleSearchPause() {
+  stopMotors();
+
+  byte mask;
+  int position;
+  bool hasLine = updateLineTracking(mask, position);
+
+  if (hasLine) {
+    if (hasObject) changeState(STATE_CARRY_OBJECT);
+    else changeState(STATE_FOLLOW_LINE);
+    return;
+  }
+
+  if (millis() - stateStartMs < SEARCH_PAUSE_MS) return;
+
+  if (millis() - lastLineSeenMs > SEARCH_STOP_TIMEOUT_MS) {
+    stopMotors();
+    return;
+  }
+
+  static bool nextLeft = false;
+  nextLeft = !nextLeft;
+
+  if (nextLeft) changeState(STATE_SEARCH_SWEEP_LEFT);
+  else changeState(STATE_SEARCH_SWEEP_RIGHT);
+}
+
+// =====================================================
+// ---------------- DEBUG ------------------------------
+// =====================================================
+void debugPrint(RobotState currentState, int frontCm, int leftCm, int rightCm) {
+  if (!DEBUG_SERIAL) return;
+  if (millis() - lastDebugPrint < DEBUG_INTERVAL_MS) return;
+
+  Serial.print("State: ");
+  switch (currentState) {
+    case STATE_FOLLOW_LINE:          Serial.print("FOLLOW"); break;
+    case STATE_BACKUP_SCAN:          Serial.print("BACKUP_SCAN"); break;
+    case STATE_TURN_TO_LINE:         Serial.print("TURN_TO_LINE"); break;
+    case STATE_SEARCH_SWEEP_LEFT:    Serial.print("SEARCH_LEFT"); break;
+    case STATE_SEARCH_SWEEP_RIGHT:   Serial.print("SEARCH_RIGHT"); break;
+    case STATE_SEARCH_PAUSE:         Serial.print("SEARCH_PAUSE"); break;
+    case STATE_APPROACH_TARGET:      Serial.print("APPROACH"); break;
+    case STATE_GRAB_OBJECT:          Serial.print("GRAB"); break;
+    case STATE_REJECT_WALL:          Serial.print("REJECT_WALL"); break;
+    case STATE_CARRY_OBJECT:         Serial.print("CARRY"); break;
+    case STATE_CARRY_DEADEND_BACKUP: Serial.print("CARRY_BACKUP"); break;
+    case STATE_CARRY_DEADEND_TURN:   Serial.print("CARRY_TURN"); break;
+  }
+
+  Serial.print(" | hasObject: "); Serial.print(hasObject);
+  Serial.print(" | clawIR: "); Serial.print(clawIrRawDetected());
+  Serial.print(" | Kp: "); Serial.print(Kp, 3);
+  Serial.print(" | LinePos: "); Serial.print(lastKnownPosition);
+  Serial.print(" | F: "); Serial.print(frontCm);
+  Serial.print(" L: "); Serial.print(leftCm);
+  Serial.print(" R: "); Serial.println(rightCm);
+
+  lastDebugPrint = millis();
+}
+
+// =====================================================
+// ---------------- OPTIONAL START PATH ----------------
+// =====================================================
+void cShapeMovement() {
+  setMotorDPS(200, 200);
+  delay(2800);
+  setMotorDPS(200, -200);
+  delay(650);
+  setMotorDPS(200, 200);
+  delay(4200);
+  setMotorDPS(200, -200);
+  delay(650);
+  setMotorDPS(200, 200);
+  delay(4000);
+  stopMotors();
+  delay(1000);
+}
+
+// =====================================================
+// ---------------- SETUP / LOOP -----------------------
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+
+  prizm.PrizmBegin();
+  prizm.setMotorInvert(1, 1);
+
+  Wire.begin();
+
+  pinMode(KP_POT_PIN, INPUT);
+
+  openClaw();
+
+  smoothedLinePosition = TARGET_POSITION;
+  lastKnownPosition = TARGET_POSITION;
+  lastLineSeenMs = millis();
+  lastLoopMs = millis();
+  stateStartMs = millis();
+
+  while (prizm.readStartButton() == 0) {
+    delay(10);
+  }
+
+  cShapeMovement();
+  changeState(STATE_FOLLOW_LINE);
+}
+
+void loop() {
+  unsigned long now = millis();
+  float dt = (now - lastLoopMs) / 1000.0f;
+  if (dt <= 0.0f) dt = 0.001f;
+  lastLoopMs = now;
+
+  updateTuning();
+
+  int frontCm = readMedianSonicCM(FRONT_US_PORT);
+  int leftCm  = readMedianSonicCM(LEFT_US_PORT);
+  int rightCm = readMedianSonicCM(RIGHT_US_PORT);
+  updateObstacleLatches(frontCm, leftCm, rightCm);
+
+  switch (state) {
+    case STATE_FOLLOW_LINE:
+      handleFollowLine(dt, frontCm, leftCm, rightCm);
+      break;
+
+    case STATE_APPROACH_TARGET:
+      handleApproachTarget(dt, frontCm, leftCm, rightCm);
+      break;
+
+    case STATE_GRAB_OBJECT:
+      handleGrabObject();
+      break;
+
+    case STATE_REJECT_WALL:
+      handleRejectWall();
+      break;
+
+    case STATE_CARRY_OBJECT:
+      handleCarryObject(dt, frontCm, leftCm, rightCm);
+      break;
+
+    case STATE_CARRY_DEADEND_BACKUP:
+      handleCarryDeadendBackup();
+      break;
+
+    case STATE_CARRY_DEADEND_TURN:
+      handleCarryDeadendTurn();
+      break;
+
+    case STATE_BACKUP_SCAN:
+      handleBackupScan();
+      break;
+
+    case STATE_TURN_TO_LINE:
+      handleTurnToLine();
+      break;
+
+    case STATE_SEARCH_SWEEP_LEFT:
+      handleSearchSweepLeft();
+      break;
+
+    case STATE_SEARCH_SWEEP_RIGHT:
+      handleSearchSweepRight();
+      break;
+
+    case STATE_SEARCH_PAUSE:
+      handleSearchPause();
+      break;
+  }
+
+  debugPrint(state, frontCm, leftCm, rightCm);
+}
