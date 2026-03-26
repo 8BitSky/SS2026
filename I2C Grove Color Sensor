@@ -1,0 +1,237 @@
+//This code is the test code to confirm the I2C grove color sensor works as intended with various colors, color ranges are currently set broadly to work with foam tiles.
+//If using this sensor on I2C with another I2C device (Line follower) make sure to use an I2C hub to connect multiple devices into the single I2C port on the tetrix prizm
+
+
+#include <PRIZM.h>
+#include <Wire.h>
+
+PRIZM prizm;
+
+// =====================================================
+// Grove Color Sensor V2.0 / TCS3472 test for PRIZM
+// =====================================================
+
+// ---------- I2C ----------
+const byte COLOR_ADDR = 0x29;
+
+// ---------- TCS3472 registers ----------
+const byte REG_ENABLE   = 0x80 | 0x00;
+const byte REG_ATIME    = 0x80 | 0x01;
+const byte REG_CONTROL  = 0x80 | 0x0F;
+const byte REG_ID       = 0x80 | 0x12;
+const byte REG_CDATAL   = 0x80 | 0x14;
+const byte REG_RDATAL   = 0x80 | 0x16;
+const byte REG_GDATAL   = 0x80 | 0x18;
+const byte REG_BDATAL   = 0x80 | 0x1A;
+
+// ---------- ENABLE bits ----------
+const byte ENABLE_PON = 0x01;
+const byte ENABLE_AEN = 0x02;
+
+// ---------- Timing ----------
+const unsigned long PRINT_INTERVAL_MS = 300;
+unsigned long lastPrintMs = 0;
+
+// ---------- Classification thresholds ----------
+// Minimum useful brightness
+const uint16_t MIN_CLEAR_VALUE = 120;
+
+// Yellow thresholds
+const float YELLOW_R_MIN = 0.35f;
+const float YELLOW_G_MIN = 0.32f;
+const float YELLOW_B_MAX = 0.30f;
+
+// Green thresholds
+const float GREEN_OVER_RED  = 0.06f;
+const float GREEN_OVER_BLUE = 0.03f;
+
+// Red thresholds
+const float RED_OVER_GREEN = 0.04f;
+const float RED_OVER_BLUE  = 0.01f;
+
+// Blue thresholds
+const float BLUE_OVER_RED   = 0.05f;
+const float BLUE_OVER_GREEN = 0.05f;
+
+// =====================================================
+// I2C helpers
+// =====================================================
+bool writeReg8(byte reg, byte value) {
+  Wire.beginTransmission(COLOR_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  return (Wire.endTransmission() == 0);
+}
+
+bool readReg8(byte reg, byte &value) {
+  Wire.beginTransmission(COLOR_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+
+  byte count = Wire.requestFrom(COLOR_ADDR, (uint8_t)1);
+  if (count != 1 || !Wire.available()) return false;
+
+  value = Wire.read();
+  return true;
+}
+
+bool readReg16(byte lowReg, uint16_t &value) {
+  Wire.beginTransmission(COLOR_ADDR);
+  Wire.write(lowReg);
+  if (Wire.endTransmission(false) != 0) return false;
+
+  byte count = Wire.requestFrom(COLOR_ADDR, (uint8_t)2);
+  if (count != 2 || Wire.available() < 2) return false;
+
+  byte lowByte = Wire.read();
+  byte highByte = Wire.read();
+  value = ((uint16_t)highByte << 8) | lowByte;
+  return true;
+}
+
+bool sensorPresent() {
+  Wire.beginTransmission(COLOR_ADDR);
+  return (Wire.endTransmission() == 0);
+}
+
+bool initColorSensor() {
+  if (!sensorPresent()) return false;
+
+  byte idVal = 0;
+  if (readReg8(REG_ID, idVal)) {
+    Serial.print("ID register: 0x");
+    if (idVal < 16) Serial.print("0");
+    Serial.println(idVal, HEX);
+  } else {
+    Serial.println("Could not read ID register.");
+  }
+
+  // Power on
+  if (!writeReg8(REG_ENABLE, ENABLE_PON)) return false;
+  delay(5);
+
+  // Integration time
+  if (!writeReg8(REG_ATIME, 0xD5)) return false;
+
+  // Gain: 0x00=1x, 0x01=4x, 0x02=16x, 0x03=60x
+  if (!writeReg8(REG_CONTROL, 0x01)) return false; // 4x gain
+
+  // Enable RGBC
+  if (!writeReg8(REG_ENABLE, ENABLE_PON | ENABLE_AEN)) return false;
+  delay(50);
+
+  return true;
+}
+
+bool readRGBC(uint16_t &c, uint16_t &r, uint16_t &g, uint16_t &b) {
+  bool ok = true;
+  ok &= readReg16(REG_CDATAL, c);
+  ok &= readReg16(REG_RDATAL, r);
+  ok &= readReg16(REG_GDATAL, g);
+  ok &= readReg16(REG_BDATAL, b);
+  return ok;
+}
+
+// =====================================================
+// Color classification
+// =====================================================
+const char* classifyColor(uint16_t c, uint16_t r, uint16_t g, uint16_t b) {
+  if (c < MIN_CLEAR_VALUE) {
+    return "TOO_DIM";
+  }
+
+  float sum = (float)r + (float)g + (float)b;
+  if (sum < 1.0f) {
+    return "NONE";
+  }
+
+  float rN = (float)r / sum;
+  float gN = (float)g / sum;
+  float bN = (float)b / sum;
+
+  // Yellow: both red and green strong, blue clearly lower
+  if (rN > YELLOW_R_MIN && gN > YELLOW_G_MIN && bN < YELLOW_B_MAX) {
+    return "YELLOW";
+  }
+
+  // Green: green is largest, but allow blue to still be moderately high
+  if (gN > rN + GREEN_OVER_RED && gN > bN + GREEN_OVER_BLUE) {
+    return "GREEN";
+  }
+
+  // Red: red is largest, allow blue to be relatively close, but green should be lower
+  if (rN > gN + RED_OVER_GREEN && rN > bN + RED_OVER_BLUE && gN < bN) {
+    return "RED";
+  }
+
+  // Blue: blue must be clearly largest
+  if (bN > rN + BLUE_OVER_RED && bN > gN + BLUE_OVER_GREEN) {
+    return "BLUE";
+  }
+
+  return "UNKNOWN";
+}
+
+void printNormalized(uint16_t r, uint16_t g, uint16_t b) {
+  float sum = (float)r + (float)g + (float)b;
+  if (sum < 1.0f) return;
+
+  float rN = (float)r / sum;
+  float gN = (float)g / sum;
+  float bN = (float)b / sum;
+
+  Serial.print(" | rN=");
+  Serial.print(rN, 3);
+  Serial.print(" gN=");
+  Serial.print(gN, 3);
+  Serial.print(" bN=");
+  Serial.print(bN, 3);
+}
+
+void setup() {
+  Serial.begin(115200);
+  prizm.PrizmBegin();
+  Wire.begin();
+  Wire.setClock(100000);
+
+  delay(300);
+  Serial.println("PRIZM TCS3472 Color Sensor Test");
+  Serial.println("--------------------------------");
+
+  if (!initColorSensor()) {
+    Serial.println("Failed to initialize color sensor at 0x29");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  Serial.println("Color sensor initialized.");
+  Serial.println("Place colored object close to sensor.");
+}
+
+void loop() {
+  if (millis() - lastPrintMs >= PRINT_INTERVAL_MS) {
+    lastPrintMs = millis();
+
+    uint16_t c, r, g, b;
+    if (readRGBC(c, r, g, b)) {
+      const char* colorName = classifyColor(c, r, g, b);
+
+      Serial.print("C=");
+      Serial.print(c);
+      Serial.print("  R=");
+      Serial.print(r);
+      Serial.print("  G=");
+      Serial.print(g);
+      Serial.print("  B=");
+      Serial.print(b);
+
+      printNormalized(r, g, b);
+
+      Serial.print(" -> ");
+      Serial.println(colorName);
+    } else {
+      Serial.println("Read failed.");
+    }
+  }
+}
